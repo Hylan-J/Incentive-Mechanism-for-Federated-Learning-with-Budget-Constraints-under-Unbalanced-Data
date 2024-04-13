@@ -1,3 +1,4 @@
+import torch
 from torch import optim, nn
 from torch.utils.data import DataLoader
 
@@ -32,8 +33,27 @@ class Client:
                 # loss计算
                 loss = self.loss_fn(outputs, labels)
                 # 反向传播与优化,反向传播算法的核心是代价函数对网络中参数（各层的权重和偏置）的偏导表达式和。
-                self.optimizer.zero_grad()  # 梯度清零：重置模型参数的梯度。默认是累加，为了防止重复计数，在每次迭代时显式地将它们归零。
-                loss.backward()  # 反向传播计算梯度：计算当前张量w.r.t图叶的梯度。
-                self.optimizer.step()  # 参数更新：根据上面计算的梯度，调整参数
-
+                # 梯度清零：重置模型参数的梯度。默认是累加，为了防止重复计数，在每次迭代时显式地将它们归零。
+                self.optimizer.zero_grad()
+                # 反向传播计算梯度：计算当前张量w.r.t图叶的梯度。
+                loss.backward()
+                # 参数更新：根据上面计算的梯度，调整参数
+                self.optimizer.step()
         return loss
+
+    def evaluate(self):
+        test_dataloader = DataLoader(dataset=self.trainset, batch_size=self.batch_size, shuffle=False)
+        self.local_net.eval()
+
+        correct = 0
+        total = 0
+        with torch.no_grad():
+            for images, labels in test_dataloader:
+                images, labels = images.to(self.device), labels.to(self.device)
+                outputs = self.local_net(images)
+                _, predicted = torch.max(outputs.data, 1)
+                total += labels.size(0)
+                correct += (predicted == labels).sum().item()
+
+        accuracy = correct / total
+        return accuracy

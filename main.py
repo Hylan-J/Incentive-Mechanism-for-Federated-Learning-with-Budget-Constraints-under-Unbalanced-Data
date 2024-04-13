@@ -1,14 +1,14 @@
 import random
 
 import matplotlib.pyplot as plt
+import numpy as np
 import torch.utils.data
 import torchvision.datasets
 from torchvision import transforms
 
-from DeepLearning.models import *
-from FederatedLearning.aggregation_algorithm import *
-from FederatedLearning.incentive_mechanism import *
-from FederatedLearning.objects import *
+from DeepLearning import *
+from FederatedLearning import *
+
 from utils import *
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -31,10 +31,10 @@ Dataset_Parameter = {
 def init_prepare(dataset_type, divide_type):
     trainset, testset, model = None, None, None
     if dataset_type == "MNIST":
-        trainset = torchvision.datasets.MNIST(root='./DeepLearning/datasets',
+        trainset = torchvision.datasets.MNIST(root=DATASETS_ROOT_PATH,
                                               train=True,
                                               transform=transforms.ToTensor())
-        testset = torchvision.datasets.MNIST(root='./DeepLearning/datasets',
+        testset = torchvision.datasets.MNIST(root=DATASETS_ROOT_PATH,
                                              train=False,
                                              transform=transforms.ToTensor())
         model = MNIST()
@@ -125,6 +125,8 @@ def main(dataset, divide, aggregation_algorithm, incentive_mechanism, R):
     print("|{:>25}  |  {:<13s}|".format("aggregation algorithm", aggregation_algorithm))
     print("---------------------------------------------\n")
 
+    result_accuracy = 0
+
     trainset, testset, model, hyperparameter, EMDs = init_prepare(dataset, divide)
     server = init_server(testset, model, hyperparameter)
     clients = init_clients(EMDs, trainset, model, hyperparameter)
@@ -144,74 +146,70 @@ def main(dataset, divide, aggregation_algorithm, incentive_mechanism, R):
         print("\r----------------------------------------------------------------------------------")
         print("{:^86}".format("Epoch {:3d}  Budget:\033[93m{:6f}\033[0m").format(epoch, R))
         print("----------------------------------------------------------------------------------")
-        client_quotes = [random.uniform(4 * 1 / e ** EMDs[i], 6 * 1 / e ** EMDs[i]) for i in range(Num_Clients)]
-        # 如果服务器还有预算
-        if R > min(client_quotes):
-            trade_information = {
-                "R": R,
-                "c": client_quotes,
-                "EMDs": EMDs
-            }
+        client_quotes = [float(random.uniform(4 * 1 / e ** EMDs[i], 6 * 1 / e ** EMDs[i])) for i in range(Num_Clients)]
 
-            X, P = globals()[incentive_mechanism](trade_information)
+        bid_information = {
+            "R": R,
+            "c": client_quotes,
+            "EMDs": EMDs
+        }
+        # print(client_quotes)
+        X, P = globals()[incentive_mechanism](bid_information)
+
+        # 如果存在被挑选中的客户端
+        if sum(X) != 0:
             R -= sum(P)
+            selected_local_nets = []
+            for i in range(Num_Clients):
+                if X[i] == 1:
+                    clients[i].train()
+                    client_accuracies[i] = server.evaluate(clients[i].local_net)
+                    client_accumulative_profits[i] += P[i]
 
-            # 如果存在被挑选中的客户端
-            if sum(X) != 0:
-                selected_local_nets = []
-                for i in range(Num_Clients):
-                    if X[i] == 1:
-                        clients[i].train()
-                        client_accuracies[i] = server.evaluate(clients[i].local_net)
-                        client_accumulative_profits[i] += P[i]
+                    selected_local_nets.append(clients[i].local_net)
+                    print(
+                        "|client {:2d} | selected: {:1s}    quote: {:8f}    paid: {:8f}    profit: {:8f}|".
+                        format(clients[i].id, "Y", client_quotes[i], P[i], client_accumulative_profits[i]))
+                else:
+                    client_accuracies[i] = 0
+                    client_accumulative_profits[i] += 0
+                    print(
+                        "|client {:2d} | selected: {:1s}    quote: {:8f}    paid: {:8f}    profit: {:8f}|".
+                        format(clients[i].id, "N", client_quotes[i], P[i], client_accumulative_profits[i]))
 
-                        selected_local_nets.append(clients[i].local_net)
-                        print(
-                            "|client {:2d} | selected: {:1s}    quote: {:8f}    paid: {:8f}    profit: {:8f}|".
-                            format(clients[i].id, "Y", client_quotes[i], P[i], client_accumulative_profits[i]))
-                    else:
-                        client_accuracies[i] = 0
-                        client_accumulative_profits[i] += 0
-                        print(
-                            "|client {:2d} | selected: {:1s}    quote: {:8f}    paid: {:8f}    profit: {:8f}|".
-                            format(clients[i].id, "N", client_quotes[i], P[i], client_accumulative_profits[i]))
+            ####################################################################################################
+            # 使用聚合算法进行全局模型更新
+            # ------------------------------------------------------------------------------------------------ #
+            global_parameter = globals()[aggregation_algorithm](server.global_net, selected_local_nets)
+            server.global_net.load_state_dict(global_parameter)
+            # ------------------------------------------------------------------------------------------------ #
+            server_accuracy = server.evaluate(server.global_net)
+            print("|server model accuracy: \033[93m{:57s}\033[0m|".format(str(server_accuracy * 100) + "%"))
+            result_accuracy = server_accuracy
+            memory.add(server_left_budget=R,
+                       client_quotes=client_quotes,
+                       client_accumulative_profits=client_accumulative_profits,
+                       X=X,
+                       P=P,
+                       server_accuracy=server_accuracy,
+                       client_accuracies=client_accuracies)
 
-                ####################################################################################################
-                # 使用聚合算法进行全局模型更新
-                # ------------------------------------------------------------------------------------------------ #
-                global_parameter = globals()[aggregation_algorithm](server.global_net, selected_local_nets)
-                server.global_net.load_state_dict(global_parameter)
-                # ------------------------------------------------------------------------------------------------ #
-                server_accuracy = server.evaluate(server.global_net)
-                print("|server model accuracy: \033[93m{:57s}\033[0m|".format(str(server_accuracy * 100) + "%"))
+            ####################################################################################################
+            # 将服务器中的全局最优模型下发
+            # ------------------------------------------------------------------------------------------------ #
+            for client in clients:
+                client.local_net.load_state_dict(server.global_net.state_dict())
+            # ------------------------------------------------------------------------------------------------ #
+            epoch += 1
 
-                memory.add(server_left_budget=R,
-                           client_quotes=client_quotes,
-                           client_accumulative_profits=client_accumulative_profits,
-                           X=X,
-                           P=P,
-                           server_accuracy=server_accuracy,
-                           client_accuracies=client_accuracies)
-
-                ####################################################################################################
-                # 将服务器中的全局最优模型下发
-                # ------------------------------------------------------------------------------------------------ #
-                for client in clients:
-                    client.local_net.load_state_dict(server.global_net.state_dict())
-                # ------------------------------------------------------------------------------------------------ #
-                epoch += 1
-
-            # 如果客户端不再参与, 则联邦学习过程结束
-            else:
-                federated_learning_done = True
-
-        # 如果服务器没有预算了, 则联邦学习过程结束
+        # 如果客户端不再参与, 则联邦学习过程结束
         else:
             federated_learning_done = True
 
-    memory.save_excel()
-
+    # memory.save_excel()
     print("----------------------------------------------------------------------------------\n")
+
+    return result_accuracy
 
 
 if __name__ == '__main__':
@@ -219,13 +217,37 @@ if __name__ == '__main__':
     Options_Divide = ["a", "b", "c"]
     Options_Aggregation_Algorithm = ["FedAvg"]
     Options_Incentive_Mechanism = ["FMore", "FLIM", "EMD_Greedy", "EMD_FLIM"]
-    Options_R = [200, 500, 600, 800]
-    Options_Omega = [0.3, 0.5, 0.7]
+    Options_R = [100, 200, 300, 400, 500, 600, 700, 800, 900, 1000]
 
-    plt.rcParams["font.sans-serif"] = ["SimHei"]  # 设置字体
-    plt.rcParams["axes.unicode_minus"] = False  # 该语句解决图像中的“-”负号的乱码问题
-    main(dataset=Options_Dataset[0],
-         divide=Options_Divide[2],
-         aggregation_algorithm=Options_Aggregation_Algorithm[0],
-         incentive_mechanism=Options_Incentive_Mechanism[3],
-         R=Options_R[0])
+    # 设置字体
+    plt.rcParams["font.sans-serif"] = ["SimHei"]
+    # 该语句解决图像中的“-”负号的乱码问题
+    plt.rcParams["axes.unicode_minus"] = False
+
+    plot_data = {
+        'FMore': [0.0] * len(Options_R),
+        'FLIM': [0.0] * len(Options_R),
+        'EMD_Greedy': [0.0] * len(Options_R),
+        'EMD_FLIM': [0.0] * len(Options_R)
+    }
+
+    for i in Options_Incentive_Mechanism:
+        for j in range(len(Options_R)):
+            plot_data[i][j] = main(dataset=Options_Dataset[0],
+                                   divide=Options_Divide[2],
+                                   aggregation_algorithm=Options_Aggregation_Algorithm[0],
+                                   incentive_mechanism=i,
+                                   R=Options_R[j])
+    # main(dataset=Options_Dataset[0],
+    #      divide=Options_Divide[2],
+    #      aggregation_algorithm=Options_Aggregation_Algorithm[0],
+    #      incentive_mechanism=Options_Incentive_Mechanism[3],
+    #      R=Options_R[0])
+
+    plt.figure()
+    plt.plot(plot_data['FMore'], 'o-', color='b',  label='FMore(truthfulness)')
+    plt.plot(plot_data['FLIM'], '*-', color='r', label='FLIM(truthfulness)')
+    plt.plot(plot_data['EMD_Greedy'], 'p-', color='y',  label='EMD-Greedy(truthfulness)')
+    plt.plot(plot_data['EMD_FLIM'], 's-', color='g', label='EMD-FLIM(truthfulness)')
+    plt.savefig('results.png', dpi=600)
+    plt.show()
